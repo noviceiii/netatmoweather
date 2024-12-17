@@ -2,3 +2,4 @@ config.conf
 *.txt
 .git
 .gitignore
+.tokenstore
