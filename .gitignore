@@ -1,1 +1,4 @@
-*.conf
+config.conf
+*.txt
+.git
+.gitignore
