@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Source the configuration file
-source config.conf
+source config.cfg
 
 # Function to update tokens when the access token has expired
 update_tokens() {
