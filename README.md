@@ -11,5 +11,5 @@ This script fetches weather data from Netatmo devices using their API. It includ
 
 1. **Clone or download the repository** containing this script.
 2. **Create a configuration file**:
-   - Rename config.example.conf to `config.conf`.
+   - Rename config.example.conf to `config.cfg`.
    - Change accordingly.
