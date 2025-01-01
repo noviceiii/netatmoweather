@@ -1,7 +1,24 @@
 #!/bin/bash
 
-# Source the configuration file
-source config.cfg
+# This script fetches weather data from a Netatmo weather station using the Netatmo API.
+# @Version 1.2 - 01.01.2025
+# - .1 - Added support for writing output to a file
+# - .2 - better handling for config file
+
+# Configuration file path
+script_dir=$(dirname "$(realpath "$0")")
+CONFIG_FILE="$script_dir/config.cfg"         # set path to config file
+
+# Read security-relevant variables from config file
+if [ -f "$CONFIG_FILE" ]; then
+    source "$CONFIG_FILE"
+else
+    echo "Configuration file $CONFIG_FILE not found. Exiting."
+    exit 1
+fi
+
+# ------------------------------------------------------------------------------------------------------------------------------------------- 
+
 
 # Function to update tokens when the access token has expired
 update_tokens() {
