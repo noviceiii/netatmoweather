@@ -98,7 +98,7 @@ fi
 
 # Fetch outdoor module data
 fetch_weather_data "NAModule1" '"
-Temperature: \(.Temperature)°C Humidity: \(.Humidity)% 
+Temperature: \(.Temperature)°C Humidity: \(.Humidity)%, 
 "'
 
 if [ "$OUTPUT_TYPE" != "file" ]; then
@@ -107,7 +107,7 @@ fi
 
 # Fetch rain module data
 fetch_weather_data "NAModule3" '"
-Rain: \(.Rain) mm
+Rain: \(.Rain) mm, 
 "'
 
 if [ "$OUTPUT_TYPE" != "file" ]; then
@@ -116,5 +116,5 @@ fi
 
 # Fetch wind module data
 fetch_weather_data "NAModule2" '"
-Wind Strength: \(.WindStrength) km/h Wind Angle: \(.WindAngle)°
+Wind: \(.WindStrength) km/h from: \(.WindAngle)°
 "'
