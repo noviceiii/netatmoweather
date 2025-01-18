@@ -115,7 +115,7 @@ fi
 
 # Fetch outdoor module data
 fetch_weather_data "NAModule1" '"
-Temperature: \(.Temperature)°C Humidity: \(.Humidity)%, 
+Out. Temp.: \(.Temperature)°C Humidity: \(.Humidity)%, 
 "'
 
 if [ "$OUTPUT_TYPE" != "file" ]; then
@@ -124,7 +124,7 @@ fi
 
 # Fetch rain module data
 fetch_weather_data "NAModule3" '"
-Rain: \(.Rain) mm, 
+Rain: \(.Rain) mm  
 "'
 
 if [ "$OUTPUT_TYPE" != "file" ]; then
