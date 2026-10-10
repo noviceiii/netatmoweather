@@ -1,5 +1,9 @@
+# local configuration with secrets
+config.cfg
 config.conf
+
+# runtime files
+.tokenstore*
+*.lock
+*.tmp
 *.txt
-.git
-.gitignore
-.tokenstore
