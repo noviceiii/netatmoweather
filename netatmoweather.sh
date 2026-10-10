@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # This script fetches weather data from a Netatmo weather station using the Netatmo API.
-# @Version 1.4.2 - 10.10.2026
+# @Version 1.4.3 - 10.10.2026
 # - 1.1   - Added support for writing output to a file
 # - 1.2   - better handling for config file
 # - 1.3   - Fixed API base URL (api.netatmo.net → api.netatmo.com), added error handling
@@ -10,11 +10,14 @@
 #           expiry safety margin, secrets no longer visible in the process list
 # - 1.4.2 - Station data is requested only once per run, output file is replaced
 #           atomically and only on success, retry after a rejected access token
+# - 1.4.3 - Missing values are shown as n/a, unreachable modules are reported, every
+#           module can be switched off, status messages only with VERBOSE="yes",
+#           optional OUTPUT_SEPARATOR, options --help and --version
 #
 # Exit codes: 0 = ok, 1 = configuration or dependency problem, 2 = token problem,
 #             3 = weather data could not be fetched
 
-VERSION="1.4.2"
+VERSION="1.4.3"
 
 set -u
 set -o pipefail
@@ -26,6 +29,34 @@ die() {
     echo "ERROR: $*" >&2
     exit "$code"
 }
+
+# Print a warning to stderr
+warn() {
+    echo "WARNING: $*" >&2
+}
+
+# Print a status message to stderr, only if VERBOSE="yes" is set in the config file
+log() {
+    if [ "${VERBOSE:-no}" == "yes" ]; then
+        echo "$*" >&2
+    fi
+}
+
+# Command line options
+case "${1:-}" in
+    -v|--version)
+        echo "netatmoweather $VERSION"
+        exit 0
+        ;;
+    -h|--help)
+        echo "Usage: $(basename "$0") [--help|--version]"
+        echo "Fetches the current values of a Netatmo weather station."
+        echo "All settings are read from config.cfg next to the script, see config.example.cfg."
+        exit 0
+        ;;
+    "") ;;
+    *)  die 1 "Unknown option '$1'. Use --help." ;;
+esac
 
 # Check required external tools
 for tool in curl jq realpath; do
@@ -47,7 +78,12 @@ fi
 # Defaults for optional settings
 OUTPUT_TYPE="${OUTPUT_TYPE:-screen}"
 MAIN_MODULE="${MAIN_MODULE:-enable}"
+OUTDOOR_MODULE="${OUTDOOR_MODULE:-enable}"
+RAIN_MODULE="${RAIN_MODULE:-enable}"
+WIND_MODULE="${WIND_MODULE:-enable}"
 OUTPUT_FILE="${OUTPUT_FILE:-}"
+VERBOSE="${VERBOSE:-no}"
+# OUTPUT_SEPARATOR is optional and has no default, see "Build the output" below
 
 # Validate required settings
 for var in REFRESH_TOKEN_INITIAL APP_ID CLIENT_SECRET DEVICE_ID TOKEN_STORE; do
@@ -60,9 +96,16 @@ case "$OUTPUT_TYPE" in
     *)      die 1 "OUTPUT_TYPE must be 'screen' or 'file' (found: '$OUTPUT_TYPE')." ;;
 esac
 
-case "$MAIN_MODULE" in
-    enable|disable) ;;
-    *) die 1 "MAIN_MODULE must be 'enable' or 'disable' (found: '$MAIN_MODULE')." ;;
+for var in MAIN_MODULE OUTDOOR_MODULE RAIN_MODULE WIND_MODULE; do
+    case "${!var}" in
+        enable|disable) ;;
+        *) die 1 "$var must be 'enable' or 'disable' (found: '${!var}')." ;;
+    esac
+done
+
+case "$VERBOSE" in
+    yes|no) ;;
+    *) die 1 "VERBOSE must be 'yes' or 'no' (found: '$VERBOSE')." ;;
 esac
 
 # ------------------------------------------------------------------------------------------------------------------------------------------- 
@@ -170,7 +213,7 @@ EOF
         new_refresh_token="$refresh_token"
     fi
     if ! [[ "$expires_in" =~ ^[0-9]+$ ]]; then
-        echo "Warning: no valid expiration time received, the token is refreshed again on the next run." >&2
+        warn "No valid expiration time received, the token is refreshed again on the next run."
         expires_in=0
     fi
     expiration=$(( $(date +%s) + expires_in ))
@@ -184,7 +227,7 @@ EOF
         return 1
     fi
 
-    echo "Tokens have been updated successfully."
+    log "Tokens have been updated successfully."
     return 0
 }
 
@@ -212,21 +255,21 @@ ensure_valid_token() {
     now=$(date +%s)
 
     if [ ! -f "$TOKEN_STORE" ]; then
-        echo "Token store file not found. Initializing with initial tokens..."
+        log "Token store file not found. Initializing with initial tokens..."
         update_tokens "$REFRESH_TOKEN_INITIAL" || return 1
     else
         load_tokens
         if [ -z "$ACCESS_TOKEN" ] || ! [[ "$ACCESS_TOKEN_EXPIRES" =~ ^[0-9]+$ ]]; then
-            echo "Token store is incomplete or damaged. Requesting new tokens..." >&2
+            warn "Token store is incomplete or damaged. Requesting new tokens..."
             renew_tokens || return 1
         elif [ "$force" == "force" ]; then
-            echo "Renewing tokens..."
+            log "Renewing tokens..."
             renew_tokens || return 1
         elif [ "$now" -ge $((ACCESS_TOKEN_EXPIRES - TOKEN_MARGIN)) ]; then
-            echo "Access token has expired. Updating tokens..."
+            log "Access token has expired. Updating tokens..."
             renew_tokens || return 1
         else
-            echo "Access token is still valid."
+            log "Access token is still valid."
             return 0
         fi
     fi
@@ -294,11 +337,15 @@ fetch_station_data() {
     [ "$rc" -eq 0 ]
 }
 
-# Print the text for one module type ("NAMain", "NAModule1", ...) from STATION_DATA.
-# Prints nothing if the station has no such module.
+# Print the state of one module type ("NAMain", "NAModule1", ...) from STATION_DATA:
+#   ok<TAB><text>   the module delivered data, missing single values are shown as n/a
+#   unreachable     the station has lost the connection to the module
+#   nodata          the module is known but delivers no values
+#   (nothing)       the station has no module of this type
 module_line() {
     local module_type="$1"
     jq -r --arg t "$module_type" '
+        def v: if . == null then "n/a" else tostring end;
         .body.devices[0]
         | first(
             if $t == "NAMain"
@@ -306,12 +353,17 @@ module_line() {
             else (.modules[]? | select(.type == $t))
             end
           )
-        | .dashboard_data
-        | if   $t == "NAMain"    then "Temperature: \(.Temperature)°C Humidity: \(.Humidity)% Pressure: \(.Pressure) mb CO2: \(.CO2) ppm Noise: \(.Noise) dB"
-          elif $t == "NAModule1" then "Out. Temp.: \(.Temperature)°C Humidity: \(.Humidity)%"
-          elif $t == "NAModule3" then "Rain: \(.Rain) mm"
-          elif $t == "NAModule2" then "Wind: \(.WindStrength) km/h from: \(.WindAngle)°"
-          else empty
+        | if .reachable == false then "unreachable"
+          elif (.dashboard_data | type) != "object" then "nodata"
+          else
+            .dashboard_data
+            | if   $t == "NAMain"    then "Temperature: \(.Temperature|v)°C Humidity: \(.Humidity|v)% Pressure: \(.Pressure|v) mb CO2: \(.CO2|v) ppm Noise: \(.Noise|v) dB"
+              elif $t == "NAModule1" then "Out. Temp.: \(.Temperature|v)°C Humidity: \(.Humidity|v)%"
+              elif $t == "NAModule3" then "Rain: \(.Rain|v) mm"
+              elif $t == "NAModule2" then "Wind: \(.WindStrength|v) km/h from: \(.WindAngle|v)°"
+              else empty
+              end
+            | "ok\t" + .
           end
     ' <<<"$STATION_DATA" 2>/dev/null
 }
@@ -338,33 +390,41 @@ write_output_file() {
     printf '%s' "$content" > "$OUTPUT_FILE"
 }
 
-FILE_CONTENT=""
-DATA_FOUND="no"
+TITLES=()
+LINES=()
+SEPARATORS=()
 
-# Add the data of one module to the output.
-# Arguments: title for screen output, module type, separator appended in file output
+# Collect the data of one module for the output.
+# Arguments: title for screen output, module type, name of the config switch,
+#            separator that follows this module in file output
 process_module() {
     local title="$1"
     local module_type="$2"
-    local separator="$3"
-    local line
+    local switch="$3"
+    local separator="$4"
+    local state
 
-    line=$(module_line "$module_type")
-
-    if [ "$OUTPUT_TYPE" != "file" ]; then
-        echo "$title"
-    fi
-    if [ -z "$line" ]; then
-        echo "No data available for module type: $module_type"
+    if [ "${!switch}" != "enable" ]; then
         return 0
     fi
 
-    DATA_FOUND="yes"
-    if [ "$OUTPUT_TYPE" == "file" ]; then
-        FILE_CONTENT+="${line}${separator}"
-    else
-        echo "$line"
-    fi
+    state=$(module_line "$module_type")
+    case "$state" in
+        ok$'\t'*)
+            TITLES+=("$title")
+            LINES+=("${state#*$'\t'}")
+            SEPARATORS+=("$separator")
+            ;;
+        unreachable)
+            warn "${title%:} skipped: the module is not reachable (battery or radio link?)."
+            ;;
+        nodata)
+            warn "${title%:} skipped: the module delivers no values at the moment."
+            ;;
+        *)
+            warn "${title%:} skipped: the station has no module of type $module_type. Set $switch=\"disable\" to hide this message."
+            ;;
+    esac
 }
 
 # Allow only one instance at a time: two parallel refreshes would invalidate each other's tokens
@@ -386,23 +446,35 @@ case $? in
     *) die 3 "Could not fetch weather data. Existing output is left unchanged." ;;
 esac
 
-# Process main device data if enabled
-if [ "$MAIN_MODULE" == "enable" ]; then
-    process_module "Main Device Data:" "NAMain" ""
+# Collect the data of all enabled modules
+process_module "Main Device Data:"    "NAMain"    MAIN_MODULE    ", "
+process_module "Outdoor Module Data:" "NAModule1" OUTDOOR_MODULE ", "
+process_module "Rain Module Data:"    "NAModule3" RAIN_MODULE    "  "
+process_module "Wind Module Data:"    "NAModule2" WIND_MODULE    ""
+
+if [ "${#LINES[@]}" -eq 0 ]; then
+    die 3 "No data for any enabled module (check DEVICE_ID and the module switches). Existing output is left unchanged."
 fi
 
-# Outdoor, rain and wind module
-process_module "Outdoor Module Data:" "NAModule1" ", "
-process_module "Rain Module Data:" "NAModule3" "  "
-process_module "Wind Module Data:" "NAModule2" ""
-
-if [ "$DATA_FOUND" != "yes" ]; then
-    die 3 "The station returned no data for any module. Please check DEVICE_ID."
-fi
-
+# Build the output
 if [ "$OUTPUT_TYPE" == "file" ]; then
-    echo "Writing weather data to $OUTPUT_FILE"
-    write_output_file "$FILE_CONTENT" || die 1 "Could not write $OUTPUT_FILE."
+    # All values on one line without a line break at the end. The modules are joined
+    # with OUTPUT_SEPARATOR if it is set, otherwise with the separators used since version 1.x.
+    file_content=""
+    last=$(( ${#LINES[@]} - 1 ))
+    for i in "${!LINES[@]}"; do
+        file_content+="${LINES[$i]}"
+        if [ "$i" -lt "$last" ]; then
+            file_content+="${OUTPUT_SEPARATOR-${SEPARATORS[$i]}}"
+        fi
+    done
+    log "Writing weather data to $OUTPUT_FILE"
+    write_output_file "$file_content" || die 1 "Could not write $OUTPUT_FILE."
+else
+    for i in "${!LINES[@]}"; do
+        echo "${TITLES[$i]}"
+        echo "${LINES[$i]}"
+    done
 fi
 
 exit 0
