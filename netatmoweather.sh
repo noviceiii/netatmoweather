@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # This script fetches weather data from a Netatmo weather station using the Netatmo API.
-# @Version 1.4.3 - 10.10.2026
+# @Version 1.4.4 - 10.10.2026
 # - 1.1   - Added support for writing output to a file
 # - 1.2   - better handling for config file
 # - 1.3   - Fixed API base URL (api.netatmo.net → api.netatmo.com), added error handling
@@ -13,11 +13,13 @@
 # - 1.4.3 - Missing values are shown as n/a, unreachable modules are reported, every
 #           module can be switched off, status messages only with VERBOSE="yes",
 #           optional OUTPUT_SEPARATOR, options --help and --version
+# - 1.4.4 - Documentation updated (README, config example), expiry time is always
+#           read as a decimal number
 #
 # Exit codes: 0 = ok, 1 = configuration or dependency problem, 2 = token problem,
 #             3 = weather data could not be fetched
 
-VERSION="1.4.3"
+VERSION="1.4.4"
 
 set -u
 set -o pipefail
@@ -265,7 +267,7 @@ ensure_valid_token() {
         elif [ "$force" == "force" ]; then
             log "Renewing tokens..."
             renew_tokens || return 1
-        elif [ "$now" -ge $((ACCESS_TOKEN_EXPIRES - TOKEN_MARGIN)) ]; then
+        elif [ "$now" -ge $((10#$ACCESS_TOKEN_EXPIRES - TOKEN_MARGIN)) ]; then
             log "Access token has expired. Updating tokens..."
             renew_tokens || return 1
         else
