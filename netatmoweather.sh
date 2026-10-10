@@ -1,10 +1,31 @@
 #!/bin/bash
 
 # This script fetches weather data from a Netatmo weather station using the Netatmo API.
-# @Version 1.3 - 12.02.2026
-# - .1 - Added support for writing output to a file
-# - .2 - better handling for config file
-# - .3 - Fixed API base URL (api.netatmo.net → api.netatmo.com), added error handling
+# @Version 1.4.0 - 10.10.2026
+# - 1.1   - Added support for writing output to a file
+# - 1.2   - better handling for config file
+# - 1.3   - Fixed API base URL (api.netatmo.net → api.netatmo.com), added error handling
+# - 1.4.0 - Startup checks for dependencies and configuration, fixed .gitignore
+#
+# Exit codes: 0 = ok, 1 = configuration or dependency problem
+
+VERSION="1.4.0"
+
+set -u
+set -o pipefail
+
+# Print an error message to stderr and exit with the given code
+die() {
+    local code="$1"
+    shift
+    echo "ERROR: $*" >&2
+    exit "$code"
+}
+
+# Check required external tools
+for tool in curl jq realpath; do
+    command -v "$tool" >/dev/null 2>&1 || die 1 "Required tool '$tool' is not installed."
+done
 
 # Configuration file path
 script_dir=$(dirname "$(realpath "$0")")
@@ -12,11 +33,32 @@ CONFIG_FILE="$script_dir/config.cfg"         # set path to config file
 
 # Read security-relevant variables from config file
 if [ -f "$CONFIG_FILE" ]; then
+    # shellcheck source=/dev/null
     source "$CONFIG_FILE"
 else
-    echo "Configuration file $CONFIG_FILE not found. Exiting."
-    exit 1
+    die 1 "Configuration file $CONFIG_FILE not found."
 fi
+
+# Defaults for optional settings
+OUTPUT_TYPE="${OUTPUT_TYPE:-screen}"
+MAIN_MODULE="${MAIN_MODULE:-enable}"
+OUTPUT_FILE="${OUTPUT_FILE:-}"
+
+# Validate required settings
+for var in REFRESH_TOKEN_INITIAL APP_ID CLIENT_SECRET DEVICE_ID TOKEN_STORE; do
+    [ -n "${!var:-}" ] || die 1 "Setting $var is missing or empty in $CONFIG_FILE."
+done
+
+case "$OUTPUT_TYPE" in
+    screen) ;;
+    file)   [ -n "$OUTPUT_FILE" ] || die 1 "OUTPUT_TYPE is 'file' but OUTPUT_FILE is not set in $CONFIG_FILE." ;;
+    *)      die 1 "OUTPUT_TYPE must be 'screen' or 'file' (found: '$OUTPUT_TYPE')." ;;
+esac
+
+case "$MAIN_MODULE" in
+    enable|disable) ;;
+    *) die 1 "MAIN_MODULE must be 'enable' or 'disable' (found: '$MAIN_MODULE')." ;;
+esac
 
 # ------------------------------------------------------------------------------------------------------------------------------------------- 
 
