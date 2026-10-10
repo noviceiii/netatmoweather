@@ -1,17 +1,20 @@
 #!/bin/bash
 
 # This script fetches weather data from a Netatmo weather station using the Netatmo API.
-# @Version 1.4.1 - 10.10.2026
+# @Version 1.4.2 - 10.10.2026
 # - 1.1   - Added support for writing output to a file
 # - 1.2   - better handling for config file
 # - 1.3   - Fixed API base URL (api.netatmo.net → api.netatmo.com), added error handling
 # - 1.4.0 - Startup checks for dependencies and configuration, fixed .gitignore
 # - 1.4.1 - Hardened token handling: atomic token store, lock against parallel runs,
 #           expiry safety margin, secrets no longer visible in the process list
+# - 1.4.2 - Station data is requested only once per run, output file is replaced
+#           atomically and only on success, retry after a rejected access token
 #
-# Exit codes: 0 = ok, 1 = configuration or dependency problem, 2 = token problem
+# Exit codes: 0 = ok, 1 = configuration or dependency problem, 2 = token problem,
+#             3 = weather data could not be fetched
 
-VERSION="1.4.1"
+VERSION="1.4.2"
 
 set -u
 set -o pipefail
@@ -67,13 +70,21 @@ esac
 
 # Internal settings
 TOKEN_URL="https://api.netatmo.com/oauth2/token"
+API_URL="https://api.netatmo.com/api/getstationsdata"
 TOKEN_MARGIN=300        # refresh the access token this many seconds before it expires
 CURL_TIMEOUT=20         # maximum duration of a single HTTP request in seconds
 
-# Follow a symlinked token store so that replacing the file keeps the link intact
+# Follow symlinks so that replacing a file keeps the link intact
 if [ -L "$TOKEN_STORE" ]; then
     TOKEN_STORE=$(realpath "$TOKEN_STORE")
 fi
+if [ -n "$OUTPUT_FILE" ] && [ -L "$OUTPUT_FILE" ]; then
+    OUTPUT_FILE=$(realpath "$OUTPUT_FILE")
+fi
+
+# Remove a leftover temporary output file when the script ends
+TMP_OUTPUT=""
+trap '[ -n "$TMP_OUTPUT" ] && rm -f "$TMP_OUTPUT"' EXIT
 
 ACCESS_TOKEN=""
 ACCESS_TOKEN_EXPIRES=""
@@ -225,43 +236,134 @@ ensure_valid_token() {
     [ -n "$ACCESS_TOKEN" ]
 }
 
-# Function to fetch weather data from Netatmo API and display it
-fetch_weather_data() {
-    local module_type="$1"
-    local data_fields="$2"
-    
-    # Make API call and capture full response
-    local full_response=$(curl -s -X GET -H "Authorization: Bearer $ACCESS_TOKEN" "https://api.netatmo.com/api/getstationsdata?device_id=$DEVICE_ID")
-    
-    # Check for API errors
-    local error_code=$(echo "$full_response" | jq -r '.error.code // empty')
-    if [ -n "$error_code" ]; then
-        local error_msg=$(echo "$full_response" | jq -r '.error.message // "Unknown error"')
-        echo "API Error (code $error_code): $error_msg" >&2
-        return 1
-    fi
-    
-    # Extract status from response
-    local status=$(echo "$full_response" | jq -r '.status // empty')
-    if [ "$status" != "ok" ]; then
-        echo "API returned non-OK status: $status" >&2
-        echo "Response: $full_response" >&2
-        return 1
-    fi
-    
-    # Parse data based on module type
-    local response=$(echo "$full_response" | jq -r ".body.devices[0] | if .type == \"NAMain\" and \"$module_type\" == \"main\" then .dashboard_data | $data_fields else (if .modules then .modules[] | select(.type == \"$module_type\") | .dashboard_data | $data_fields else empty end) end")
+STATION_DATA=""
 
-    if [ -n "$response" ]; then
-        # Remove line breaks to make all data on one line
-        response=$(echo "$response" | tr -d '\n')
-        if [ "$OUTPUT_TYPE" == "file" ]; then
-            echo -n "$response" >> "$OUTPUT_FILE"
-        else
-            echo "$response"
+# Request the data of the weather station and keep the answer in STATION_DATA.
+# Return codes: 0 = ok, 1 = error, 3 = access token rejected by the API
+request_station_data() {
+    local response curl_rc http_code body error_code error_msg status
+
+    STATION_DATA=""
+    response=$(curl -sS --max-time "$CURL_TIMEOUT" --retry 2 -w '\n%{http_code}' -K - <<EOF
+url = "$API_URL?device_id=$(curl_quote "$DEVICE_ID")"
+header = "Authorization: Bearer $(curl_quote "$ACCESS_TOKEN")"
+EOF
+    )
+    curl_rc=$?
+    if [ "$curl_rc" -ne 0 ]; then
+        echo "No connection to the Netatmo API (curl exit code $curl_rc)." >&2
+        return 1
+    fi
+
+    http_code="${response##*$'\n'}"
+    body="${response%$'\n'*}"
+
+    # Check for API errors
+    error_code=$(jq -r '.error.code? // empty' <<<"$body" 2>/dev/null)
+    if [ -n "$error_code" ]; then
+        error_msg=$(jq -r '.error.message? // "Unknown error"' <<<"$body" 2>/dev/null)
+        echo "API Error (HTTP $http_code, code $error_code): $error_msg" >&2
+        # 2 = invalid access token, 3 = access token expired
+        if [ "$error_code" == "2" ] || [ "$error_code" == "3" ]; then
+            return 3
         fi
-    else
+        return 1
+    fi
+
+    # Extract status from response
+    status=$(jq -r '.status? // empty' <<<"$body" 2>/dev/null)
+    if [ "$status" != "ok" ]; then
+        echo "API returned an unexpected answer (HTTP $http_code): ${body:0:200}" >&2
+        return 1
+    fi
+
+    STATION_DATA="$body"
+    return 0
+}
+
+# Fetch the station data. If the API rejects the access token, renew it and try once more.
+fetch_station_data() {
+    local rc
+    request_station_data
+    rc=$?
+    if [ "$rc" -eq 3 ]; then
+        ensure_valid_token force || return 2
+        request_station_data
+        rc=$?
+    fi
+    [ "$rc" -eq 0 ]
+}
+
+# Print the text for one module type ("NAMain", "NAModule1", ...) from STATION_DATA.
+# Prints nothing if the station has no such module.
+module_line() {
+    local module_type="$1"
+    jq -r --arg t "$module_type" '
+        .body.devices[0]
+        | first(
+            if $t == "NAMain"
+            then (if .type == "NAMain" then . else empty end)
+            else (.modules[]? | select(.type == $t))
+            end
+          )
+        | .dashboard_data
+        | if   $t == "NAMain"    then "Temperature: \(.Temperature)°C Humidity: \(.Humidity)% Pressure: \(.Pressure) mb CO2: \(.CO2) ppm Noise: \(.Noise) dB"
+          elif $t == "NAModule1" then "Out. Temp.: \(.Temperature)°C Humidity: \(.Humidity)%"
+          elif $t == "NAModule3" then "Rain: \(.Rain) mm"
+          elif $t == "NAModule2" then "Wind: \(.WindStrength) km/h from: \(.WindAngle)°"
+          else empty
+          end
+    ' <<<"$STATION_DATA" 2>/dev/null
+}
+
+# Replace OUTPUT_FILE with the given text in a single step, so that readers never see
+# an empty or half written file. The permissions of an existing file are kept.
+write_output_file() {
+    local content="$1"
+
+    TMP_OUTPUT="${OUTPUT_FILE}.tmp.$$"
+    if ( printf '%s' "$content" > "$TMP_OUTPUT" ) 2>/dev/null; then
+        if [ -f "$OUTPUT_FILE" ]; then
+            chmod --reference="$OUTPUT_FILE" "$TMP_OUTPUT" 2>/dev/null
+        fi
+        if mv -f "$TMP_OUTPUT" "$OUTPUT_FILE" 2>/dev/null; then
+            TMP_OUTPUT=""
+            return 0
+        fi
+    fi
+    rm -f "$TMP_OUTPUT" 2>/dev/null
+    TMP_OUTPUT=""
+
+    # Fallback if the directory is not writable: overwrite the file in place
+    printf '%s' "$content" > "$OUTPUT_FILE"
+}
+
+FILE_CONTENT=""
+DATA_FOUND="no"
+
+# Add the data of one module to the output.
+# Arguments: title for screen output, module type, separator appended in file output
+process_module() {
+    local title="$1"
+    local module_type="$2"
+    local separator="$3"
+    local line
+
+    line=$(module_line "$module_type")
+
+    if [ "$OUTPUT_TYPE" != "file" ]; then
+        echo "$title"
+    fi
+    if [ -z "$line" ]; then
         echo "No data available for module type: $module_type"
+        return 0
+    fi
+
+    DATA_FOUND="yes"
+    if [ "$OUTPUT_TYPE" == "file" ]; then
+        FILE_CONTENT+="${line}${separator}"
+    else
+        echo "$line"
     fi
 }
 
@@ -276,46 +378,31 @@ fi
 # Load the access token and renew it if necessary
 ensure_valid_token || die 2 "No valid access token available."
 
-# Fetch and display weather data
-if [ "$OUTPUT_TYPE" == "file" ]; then
-    # Clear the file if it exists
-    > "$OUTPUT_FILE"
-    echo "Writing weather data to $OUTPUT_FILE"
-fi
+# Fetch the data of all modules with a single API call
+fetch_station_data
+case $? in
+    0) ;;
+    2) die 2 "No valid access token available." ;;
+    *) die 3 "Could not fetch weather data. Existing output is left unchanged." ;;
+esac
 
 # Process main device data if enabled
 if [ "$MAIN_MODULE" == "enable" ]; then
-    if [ "$OUTPUT_TYPE" != "file" ]; then
-        echo "Main Device Data:"
-    fi
-    fetch_weather_data "main" '"
-Temperature: \(.Temperature)°C Humidity: \(.Humidity)% Pressure: \(.Pressure) mb CO2: \(.CO2) ppm Noise: \(.Noise) dB
-"'
+    process_module "Main Device Data:" "NAMain" ""
 fi
 
-if [ "$OUTPUT_TYPE" != "file" ]; then
-    echo "Outdoor Module Data:"
+# Outdoor, rain and wind module
+process_module "Outdoor Module Data:" "NAModule1" ", "
+process_module "Rain Module Data:" "NAModule3" "  "
+process_module "Wind Module Data:" "NAModule2" ""
+
+if [ "$DATA_FOUND" != "yes" ]; then
+    die 3 "The station returned no data for any module. Please check DEVICE_ID."
 fi
 
-# Fetch outdoor module data
-fetch_weather_data "NAModule1" '"
-Out. Temp.: \(.Temperature)°C Humidity: \(.Humidity)%, 
-"'
-
-if [ "$OUTPUT_TYPE" != "file" ]; then
-    echo "Rain Module Data:"
+if [ "$OUTPUT_TYPE" == "file" ]; then
+    echo "Writing weather data to $OUTPUT_FILE"
+    write_output_file "$FILE_CONTENT" || die 1 "Could not write $OUTPUT_FILE."
 fi
 
-# Fetch rain module data
-fetch_weather_data "NAModule3" '"
-Rain: \(.Rain) mm  
-"'
-
-if [ "$OUTPUT_TYPE" != "file" ]; then
-    echo "Wind Module Data:"
-fi
-
-# Fetch wind module data
-fetch_weather_data "NAModule2" '"
-Wind: \(.WindStrength) km/h from: \(.WindAngle)°
-"'
+exit 0
