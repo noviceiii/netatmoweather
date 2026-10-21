@@ -130,6 +130,7 @@ Netatmo updates the station data about every 10 minutes, shorter intervals bring
 - 1.4.3 - `n/a` for missing values, warnings for unreachable modules, switches for every module, `OUTPUT_SEPARATOR`, `VERBOSE`
 - 1.4.4 - Documentation
 - 1.4.5 - Safer token store (complete write, sync, no second refresh after a store error), cleanup on interrupt, unpredictable temp file names, DEVICE_ID check, connect timeout, permission warning for `config.cfg`, offline tests
+- 1.4.6 - Fix crash and wrong titles when modules are unreachable
 
 Things that behave differently than in version 1.3:
 
@@ -157,4 +158,4 @@ Things that behave differently than in version 1.3:
 
 ## Tests
 
-`tests/run_tests.sh` checks token handling, error paths and the output formats without a Netatmo account (curl is replaced by a stub). It only needs bash and jq.
+`tests/run_tests.sh` checks token handling, error paths and the output formats without a Netatmo account (curl is replaced by a stub). It only needs bash and jq. With python3 the output is also checked in a terminal, as when the script is started by hand.

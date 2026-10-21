@@ -85,6 +85,39 @@ run() {
     RC=$?
     ERR=$(cat "$T/stderr")
 }
+# Run the script in a pseudo terminal with 55 rows, like a start by hand on the Pi.
+# bash then sets LINES and COLUMNS after each external command (checkwinsize).
+# stdout and stderr share the terminal, so they are split by their prefix.
+HAVE_PTY=no
+if command -v python3 >/dev/null 2>&1; then
+    HAVE_PTY=yes
+    cat > "$work/ptyrun.py" <<'PYEOF'
+import fcntl, os, pty, struct, sys, termios
+pid, fd = pty.fork()
+if pid == 0:
+    fcntl.ioctl(0, termios.TIOCSWINSZ, struct.pack("HHHH", 55, 120, 0, 0))
+    os.execvp(sys.argv[1], sys.argv[1:])
+out = b""
+while True:
+    try:
+        data = os.read(fd, 4096)
+    except OSError:
+        break
+    if not data:
+        break
+    out += data
+_, status = os.waitpid(pid, 0)
+sys.stdout.buffer.write(out.replace(b"\r\n", b"\n"))
+sys.exit(os.WEXITSTATUS(status) if os.WIFEXITED(status) else 128 + os.WTERMSIG(status))
+PYEOF
+fi
+run_tty() {
+    local all
+    all=$(PATH="$work/bin:$PATH" python3 "$work/ptyrun.py" "$T/app/netatmoweather.sh" </dev/null)
+    RC=$?
+    OUT=$(grep -vE '^(WARNING|ERROR):|netatmoweather\.sh: line' <<<"$all")
+    ERR=$(grep -E '^(WARNING|ERROR):|netatmoweather\.sh: line' <<<"$all")
+}
 calls() { cat "$MOCK/$1.count" 2>/dev/null || echo 0; }
 store_line() { sed -n "s/^$1: //p" "$T/app/.tokenstore"; }
 valid_store() {
@@ -94,7 +127,7 @@ valid_store() {
 
 # --- options -----------------------------------------------------------------
 setup
-run --version;  check "--version" [ "$RC" -eq 0 -a "$OUT" == "netatmoweather 1.4.5" ]
+run --version;  check "--version" [ "$RC" -eq 0 -a "$OUT" == "netatmoweather 1.4.6" ]
 run --help;     check "--help exits 0" [ "$RC" -eq 0 ]
 run --bogus;    check "unknown option exits 1" [ "$RC" -eq 1 ]
 
@@ -253,6 +286,46 @@ valid_store $(( $(date +%s) + 3600 ))
 jq -c '.body.devices[0].dashboard_data.CO2 = null' <<<"$STATION_OK" > "$MOCK/station.body"
 run
 check "missing value shown as n/a" grep -q 'CO2: n/a ppm' <<<"$OUT"
+
+# --- module combinations: titles must always match their data -----------------
+# Each case runs with a pipe (cron) and in a terminal (start by hand).
+MAIN_L='Temperature: 21.4°C Humidity: 45% Pressure: 1013.2 mb CO2: 512 ppm Noise: 38 dB'
+OUT_L='Out. Temp.: 12.3°C Humidity: 80%'
+RAIN_L='Rain: 0 mm'
+WIND_L='Wind: 5 km/h from: 180°'
+# Arguments: name, jq filter for the station answer, expected screen output, expected file output
+combo() {
+    local name="$1" filter="$2" screen="$3" file="$4" runner
+    for runner in run run_tty; do
+        [ "$runner" == run_tty ] && [ "$HAVE_PTY" != yes ] && continue
+        setup
+        valid_store $(( $(date +%s) + 3600 ))
+        jq -c "$filter" <<<"$STATION_OK" > "$MOCK/station.body"
+        "$runner"
+        check "$name ($runner): screen output" [ "$OUT" == "$screen" ]
+        check "$name ($runner): exit 0, no crash" [ "$RC" -eq 0 ] && not grep -q 'unbound variable' <<<"$ERR"
+        setup 'OUTPUT_TYPE="file"'
+        valid_store $(( $(date +%s) + 3600 ))
+        jq -c "$filter" <<<"$STATION_OK" > "$MOCK/station.body"
+        "$runner"
+        check "$name ($runner): file output" [ "$(cat "$T/app/weatherinfo.txt" 2>/dev/null)" == "$file" ]
+    done
+}
+combo "rain and wind unreachable" \
+    '.body.devices[0].modules |= map(if .type == "NAModule3" or .type == "NAModule2" then .reachable = false else . end)' \
+    "$(printf 'Main Device Data:\n%s\nOutdoor Module Data:\n%s' "$MAIN_L" "$OUT_L")" \
+    "$MAIN_L, $OUT_L"
+combo "only rain unreachable" \
+    '.body.devices[0].modules |= map(if .type == "NAModule3" then .reachable = false else . end)' \
+    "$(printf 'Main Device Data:\n%s\nOutdoor Module Data:\n%s\nWind Module Data:\n%s' "$MAIN_L" "$OUT_L" "$WIND_L")" \
+    "$MAIN_L, $OUT_L, $WIND_L"
+combo "only outdoor unreachable" \
+    '.body.devices[0].modules |= map(if .type == "NAModule1" then .reachable = false else . end)' \
+    "$(printf 'Main Device Data:\n%s\nRain Module Data:\n%s\nWind Module Data:\n%s' "$MAIN_L" "$RAIN_L" "$WIND_L")" \
+    "$MAIN_L, $RAIN_L  $WIND_L"
+combo "all present" "." "$SCREEN_OK" "$FILE_OK"
+combo "main only" '.body.devices[0].modules = []' \
+    "$(printf 'Main Device Data:\n%s' "$MAIN_L")" "$MAIN_L"
 
 # --- configuration checks -------------------------------------------------------
 setup 'DEVICE_ID="xx:xx:xx:xx:xx:xx"'

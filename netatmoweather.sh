@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # This script fetches weather data from a Netatmo weather station using the Netatmo API.
-# @Version 1.4.5 - 21.10.2026
+# @Version 1.4.6 - 21.10.2026
 # - 1.1   - Added support for writing output to a file
 # - 1.2   - better handling for config file
 # - 1.3   - Fixed API base URL (api.netatmo.net → api.netatmo.com), added error handling
@@ -20,11 +20,13 @@
 #           files are removed on interrupt, unpredictable temporary output file name,
 #           DEVICE_ID checked and URL-encoded, connect timeout, warning for a config file
 #           readable by others
+# - 1.4.6 - Fix crash and wrong titles when modules are unreachable: the output array was
+#           called LINES, which bash overwrites with the terminal height in a terminal
 #
 # Exit codes: 0 = ok, 1 = configuration or dependency problem, 2 = token problem,
 #             3 = weather data could not be fetched
 
-VERSION="1.4.5"
+VERSION="1.4.6"
 
 set -u
 set -o pipefail
@@ -447,9 +449,11 @@ write_output_file() {
     printf '%s' "$content" > "$OUTPUT_FILE"
 }
 
-TITLES=()
-LINES=()
-SEPARATORS=()
+# Collected output, one entry per module. Do not use the names LINES or COLUMNS here:
+# in a terminal bash sets them to the window size after each external command.
+OUT_TITLES=()
+OUT_VALUES=()
+OUT_SEPARATORS=()
 
 # Collect the data of one module for the output.
 # Arguments: title for screen output, module type, name of the config switch,
@@ -468,9 +472,9 @@ process_module() {
     state=$(module_line "$module_type")
     case "$state" in
         ok$'\t'*)
-            TITLES+=("$title")
-            LINES+=("${state#*$'\t'}")
-            SEPARATORS+=("$separator")
+            OUT_TITLES+=("$title")
+            OUT_VALUES+=("${state#*$'\t'}")
+            OUT_SEPARATORS+=("$separator")
             ;;
         unreachable)
             warn "${title%:} skipped: the module is not reachable (battery or radio link?)."
@@ -509,7 +513,7 @@ process_module "Outdoor Module Data:" "NAModule1" OUTDOOR_MODULE ", "
 process_module "Rain Module Data:"    "NAModule3" RAIN_MODULE    "  "
 process_module "Wind Module Data:"    "NAModule2" WIND_MODULE    ""
 
-if [ "${#LINES[@]}" -eq 0 ]; then
+if [ "${#OUT_VALUES[@]}" -eq 0 ]; then
     die 3 "No data for any enabled module (check DEVICE_ID and the module switches). Existing output is left unchanged."
 fi
 
@@ -518,19 +522,19 @@ if [ "$OUTPUT_TYPE" == "file" ]; then
     # All values on one line without a line break at the end. The modules are joined
     # with OUTPUT_SEPARATOR if it is set, otherwise with the separators used since version 1.x.
     file_content=""
-    last=$(( ${#LINES[@]} - 1 ))
-    for i in "${!LINES[@]}"; do
-        file_content+="${LINES[$i]}"
+    last=$(( ${#OUT_VALUES[@]} - 1 ))
+    for (( i = 0; i <= last; i++ )); do
+        file_content+="${OUT_VALUES[$i]}"
         if [ "$i" -lt "$last" ]; then
-            file_content+="${OUTPUT_SEPARATOR-${SEPARATORS[$i]}}"
+            file_content+="${OUTPUT_SEPARATOR-${OUT_SEPARATORS[$i]}}"
         fi
     done
     log "Writing weather data to $OUTPUT_FILE"
     write_output_file "$file_content" || die 1 "Could not write $OUTPUT_FILE."
 else
-    for i in "${!LINES[@]}"; do
-        echo "${TITLES[$i]}"
-        echo "${LINES[$i]}"
+    for (( i = 0; i < ${#OUT_VALUES[@]}; i++ )); do
+        echo "${OUT_TITLES[$i]}"
+        echo "${OUT_VALUES[$i]}"
     done
 fi
 
