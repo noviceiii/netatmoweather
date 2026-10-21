@@ -35,7 +35,7 @@ sudo apt-get install curl jq
    - `cp config.example.cfg config.cfg && chmod 600 config.cfg`
    - Use full paths in the config file
    - Update the values with your credentials
-6. **Test it**: `./netatmoweather.sh` should print the values of your station. Run it as the user that runs it from cron later, because that user owns the token store.
+6. **First run**: `./netatmoweather.sh` should print the values of your station. Run it as the user that runs it from cron later, because that user owns the token store.
 
 ## Configuration
 
@@ -108,8 +108,8 @@ Netatmo updates the station data about every 10 minutes, shorter intervals bring
 | Code | Meaning |
 |---|---|
 | 0 | Data fetched, at least one module delivered values |
-| 1 | Configuration or dependency problem, output file not writable, another instance running |
-| 2 | No valid access token (refresh failed) |
+| 1 | Configuration or dependency problem, output file or lock file not writable, another instance running |
+| 2 | No valid access token (refresh failed, or the new tokens could not be stored) |
 | 3 | Weather data could not be fetched, existing output left unchanged |
 
 ## Token handling
@@ -119,31 +119,28 @@ Netatmo updates the station data about every 10 minutes, shorter intervals bring
 - The token store is created with mode 600 and synced to disk before it replaces the old one, so a power cut right after a refresh does not lose the new token. If the new tokens cannot be stored, the script stops and does not spend another token.
 - The token refresh is never retried automatically: a retry after a lost answer would send a token that is already invalid.
 - Secrets are passed to curl on stdin and do not show up in the process list. They are never written to stdout, stderr or the log.
-- The script warns if `config.cfg` can be read by other users.
 - If the stored refresh token is rejected, the script tries `REFRESH_TOKEN_INITIAL` from the config file. To recover, generate a new token, enter it in `config.cfg` and run the script again. Deleting the token store is not necessary.
 
-## Changes in version 1.4
+## Version history
 
+- 1.1 - Output to a file
+- 1.2 - Better handling of the config file
+- 1.3 - API base URL changed from `api.netatmo.net` to `api.netatmo.com`, error handling for API responses
 - 1.4.0 - Startup checks for tools and settings; `.gitignore` now really excludes `config.cfg`
 - 1.4.1 - Hardened token handling (atomic store, lock, safety margin, secrets off the command line)
 - 1.4.2 - One API call per run instead of one per module, atomic output file, exit codes, retry after a rejected token
 - 1.4.3 - `n/a` for missing values, warnings for unreachable modules, switches for every module, `OUTPUT_SEPARATOR`, `VERBOSE`
 - 1.4.4 - Documentation
-- 1.4.5 - Safer token store (complete write, sync, no second refresh after a store error), cleanup on interrupt, unpredictable temp file names, DEVICE_ID check, connect timeout, permission warning for `config.cfg`, offline tests
+- 1.4.5 - Safer token store (complete write, sync, no second refresh after a store error), cleanup on interrupt, unpredictable temp file names, DEVICE_ID check, connect timeout, permission warning for `config.cfg`
 - 1.4.6 - Fix crash and wrong titles when modules are unreachable
 
-Things that behave differently than in version 1.3:
+### Differences to version 1.3
 
 - Status messages such as "Access token is still valid." are only printed with `VERBOSE="yes"`.
 - File output has a `, ` between main and outdoor module (it was missing) and no separator at the end of the line.
 - Missing modules are reported on stderr instead of stdout.
 - The line `Refresh Token Expires` is no longer written to the token store. An existing store is read without changes.
-- Since 1.4.5 a `DEVICE_ID` that is not a MAC address is rejected (exit code 1), and a `config.cfg` that others can read causes a warning on every run.
-
-## API Changes (v1.3)
-
-- Fixed API base URL: Changed from `api.netatmo.net` to `api.netatmo.com`
-- Added comprehensive error handling for API responses
+- A `DEVICE_ID` that is not a MAC address is rejected (exit code 1), and a `config.cfg` that others can read causes a warning on every run.
 
 ## Troubleshooting
 
@@ -155,7 +152,3 @@ Things that behave differently than in version 1.3:
 6. **"The new tokens are kept in ..."**: The token store could not be replaced. Fix the cause (permissions, disk full), then move the named file to TOKEN_STORE. It holds the only valid refresh token.
 7. **"can be read by other users"**: `chmod 600 config.cfg`.
 8. **Tokens become invalid every few hours**: Another installation or tool uses the same Netatmo app and token. Give each installation its own token.
-
-## Tests
-
-`tests/run_tests.sh` checks token handling, error paths and the output formats without a Netatmo account (curl is replaced by a stub). It only needs bash and jq. With python3 the output is also checked in a terminal, as when the script is started by hand.
