@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # This script fetches weather data from a Netatmo weather station using the Netatmo API.
-# @Version 1.4.4 - 10.10.2026
+# @Version 1.4.5 - 21.10.2026
 # - 1.1   - Added support for writing output to a file
 # - 1.2   - better handling for config file
 # - 1.3   - Fixed API base URL (api.netatmo.net → api.netatmo.com), added error handling
@@ -15,11 +15,16 @@
 #           optional OUTPUT_SEPARATOR, options --help and --version
 # - 1.4.4 - Documentation updated (README, config example), expiry time is always
 #           read as a decimal number
+# - 1.4.5 - Token store is only replaced if it was written completely and synced to disk,
+#           no second refresh after tokens were issued but could not be stored, temporary
+#           files are removed on interrupt, unpredictable temporary output file name,
+#           DEVICE_ID checked and URL-encoded, connect timeout, warning for a config file
+#           readable by others
 #
 # Exit codes: 0 = ok, 1 = configuration or dependency problem, 2 = token problem,
 #             3 = weather data could not be fetched
 
-VERSION="1.4.4"
+VERSION="1.4.5"
 
 set -u
 set -o pipefail
@@ -54,6 +59,8 @@ case "${1:-}" in
         echo "Usage: $(basename "$0") [--help|--version]"
         echo "Fetches the current values of a Netatmo weather station."
         echo "All settings are read from config.cfg next to the script, see config.example.cfg."
+        echo "Exit codes: 0 = ok, 1 = configuration or dependency problem, 2 = token problem,"
+        echo "            3 = weather data could not be fetched"
         exit 0
         ;;
     "") ;;
@@ -77,6 +84,12 @@ else
     die 1 "Configuration file $CONFIG_FILE not found."
 fi
 
+# The config file holds the client secret: warn if group or others can read it
+config_mode=$(stat -c '%a' "$CONFIG_FILE" 2>/dev/null) || config_mode=""
+if [[ "$config_mode" =~ ^[0-7]+$ ]] && (( 8#$config_mode & 8#077 )); then
+    warn "$CONFIG_FILE can be read by other users (mode $config_mode). Fix with: chmod 600 $CONFIG_FILE"
+fi
+
 # Defaults for optional settings
 OUTPUT_TYPE="${OUTPUT_TYPE:-screen}"
 MAIN_MODULE="${MAIN_MODULE:-enable}"
@@ -91,6 +104,11 @@ VERBOSE="${VERBOSE:-no}"
 for var in REFRESH_TOKEN_INITIAL APP_ID CLIENT_SECRET DEVICE_ID TOKEN_STORE; do
     [ -n "${!var:-}" ] || die 1 "Setting $var is missing or empty in $CONFIG_FILE."
 done
+
+# The device ID is the MAC address of the main station, e.g. 70:ee:50:12:34:56
+if ! [[ "$DEVICE_ID" =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]]; then
+    die 1 "DEVICE_ID must be the MAC address of the station, e.g. 70:ee:50:12:34:56 (found: '$DEVICE_ID')."
+fi
 
 case "$OUTPUT_TYPE" in
     screen) ;;
@@ -118,6 +136,7 @@ TOKEN_URL="https://api.netatmo.com/oauth2/token"
 API_URL="https://api.netatmo.com/api/getstationsdata"
 TOKEN_MARGIN=300        # refresh the access token this many seconds before it expires
 CURL_TIMEOUT=20         # maximum duration of a single HTTP request in seconds
+CONNECT_TIMEOUT=10      # maximum time to establish the connection in seconds
 
 # Follow symlinks so that replacing a file keeps the link intact
 if [ -L "$TOKEN_STORE" ]; then
@@ -127,9 +146,18 @@ if [ -n "$OUTPUT_FILE" ] && [ -L "$OUTPUT_FILE" ]; then
     OUTPUT_FILE=$(realpath "$OUTPUT_FILE")
 fi
 
-# Remove a leftover temporary output file when the script ends
+# Remove leftover temporary files when the script ends, also after Ctrl+C or kill
 TMP_OUTPUT=""
-trap '[ -n "$TMP_OUTPUT" ] && rm -f "$TMP_OUTPUT"' EXIT
+TMP_TOKEN=""
+# shellcheck disable=SC2329  # called by the EXIT trap
+cleanup() {
+    [ -n "$TMP_OUTPUT" ] && rm -f "$TMP_OUTPUT"
+    [ -n "$TMP_TOKEN" ] && rm -f "$TMP_TOKEN"
+    return 0
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 ACCESS_TOKEN=""
 ACCESS_TOKEN_EXPIRES=""
@@ -156,7 +184,10 @@ load_tokens() {
 }
 
 # Request new tokens with the given refresh token and store them.
-# Return codes: 0 = ok, 1 = refresh rejected or store not writable, 2 = no usable answer from the server
+# Return codes: 0 = ok, 1 = refresh rejected or store not writable, 2 = no usable answer from the server,
+#               4 = the server issued new tokens, but they could not be stored
+# The request is deliberately not retried: if the server has processed it but the answer
+# got lost, a retry would send a refresh token that is no longer valid.
 update_tokens() {
     local refresh_token="$1"
     local tmp_store response curl_rc http_code body error error_desc
@@ -168,9 +199,10 @@ update_tokens() {
         echo "Cannot write to the directory of the token store ($TOKEN_STORE)." >&2
         return 1
     fi
+    TMP_TOKEN="$tmp_store"
 
     # The request is passed on stdin so that the secrets do not show up in the process list
-    response=$(curl -sS --max-time "$CURL_TIMEOUT" -w '\n%{http_code}' -K - <<EOF
+    response=$(curl -sS --connect-timeout "$CONNECT_TIMEOUT" --max-time "$CURL_TIMEOUT" -w '\n%{http_code}' -K - <<EOF
 url = "$TOKEN_URL"
 data-urlencode = "grant_type=refresh_token"
 data-urlencode = "refresh_token=$(curl_quote "$refresh_token")"
@@ -181,6 +213,7 @@ EOF
     curl_rc=$?
     if [ "$curl_rc" -ne 0 ]; then
         rm -f "$tmp_store"
+        TMP_TOKEN=""
         echo "Token refresh failed: no connection to the Netatmo API (curl exit code $curl_rc)." >&2
         return 2
     fi
@@ -193,6 +226,7 @@ EOF
     if [ -n "$error" ]; then
         error_desc=$(jq -r '.error_description // "no description"' <<<"$body" 2>/dev/null)
         rm -f "$tmp_store"
+        TMP_TOKEN=""
         echo "Token refresh failed (HTTP $http_code): $error - $error_desc" >&2
         echo "Please check your credentials and refresh token." >&2
         return 1
@@ -206,6 +240,7 @@ EOF
     # Validate that we got valid tokens
     if [ -z "$new_access_token" ]; then
         rm -f "$tmp_store"
+        TMP_TOKEN=""
         echo "Token refresh failed (HTTP $http_code): unexpected answer: ${body:0:200}" >&2
         return 2
     fi
@@ -220,14 +255,25 @@ EOF
     fi
     expiration=$(( $(date +%s) + expires_in ))
 
-    # Write the complete store to a temporary file and replace the old one in a single step
-    printf 'Access Token: %s\nAccess Token Expires: %s\nRefresh Token: %s\n' \
-        "$new_access_token" "$expiration" "$new_refresh_token" > "$tmp_store"
-    chmod 600 "$tmp_store"
-    if ! mv -f "$tmp_store" "$TOKEN_STORE"; then
-        echo "Could not replace the token store $TOKEN_STORE. The new tokens are kept in $tmp_store." >&2
-        return 1
+    # Write the complete store to a temporary file and replace the old one in a single step.
+    # The old store is only replaced if the new one was written completely (full disk) and
+    # is on the disk (power loss right after the refresh), because the old token is spent.
+    if ! { printf 'Access Token: %s\nAccess Token Expires: %s\nRefresh Token: %s\n' \
+                "$new_access_token" "$expiration" "$new_refresh_token" > "$tmp_store" &&
+           chmod 600 "$tmp_store"; } 2>/dev/null; then
+        echo "Could not write the new tokens to $tmp_store (disk full?). The refresh token has been" >&2
+        echo "used up: generate a new one and enter it as REFRESH_TOKEN_INITIAL." >&2
+        return 4
     fi
+    sync "$tmp_store" 2>/dev/null
+    if ! mv -f "$tmp_store" "$TOKEN_STORE"; then
+        # keep the file: it holds the only valid refresh token now
+        TMP_TOKEN=""
+        echo "Could not replace the token store $TOKEN_STORE. The new tokens are kept in $tmp_store." >&2
+        return 4
+    fi
+    TMP_TOKEN=""
+    sync "$(dirname "$TOKEN_STORE")" 2>/dev/null
 
     log "Tokens have been updated successfully."
     return 0
@@ -241,7 +287,8 @@ renew_tokens() {
         update_tokens "$STORED_REFRESH_TOKEN"
         rc=$?
         [ "$rc" -eq 0 ] && return 0
-        # no fallback if the server could not be reached or both tokens are identical
+        # no fallback if the server could not be reached, the new tokens could not be
+        # stored or both tokens are identical
         [ "$rc" -eq 1 ] || return 1
         [ "$STORED_REFRESH_TOKEN" != "$REFRESH_TOKEN_INITIAL" ] || return 1
         echo "Trying REFRESH_TOKEN_INITIAL from the config file..." >&2
@@ -289,8 +336,10 @@ request_station_data() {
     local response curl_rc http_code body error_code error_msg status
 
     STATION_DATA=""
-    response=$(curl -sS --max-time "$CURL_TIMEOUT" --retry 2 -w '\n%{http_code}' -K - <<EOF
-url = "$API_URL?device_id=$(curl_quote "$DEVICE_ID")"
+    response=$(curl -sS --connect-timeout "$CONNECT_TIMEOUT" --max-time "$CURL_TIMEOUT" --retry 2 -w '\n%{http_code}' -K - <<EOF
+url = "$API_URL"
+get
+data-urlencode = "device_id=$(curl_quote "$DEVICE_ID")"
 header = "Authorization: Bearer $(curl_quote "$ACCESS_TOKEN")"
 EOF
     )
@@ -374,18 +423,24 @@ module_line() {
 # an empty or half written file. The permissions of an existing file are kept.
 write_output_file() {
     local content="$1"
+    local mode
 
-    TMP_OUTPUT="${OUTPUT_FILE}.tmp.$$"
-    if ( printf '%s' "$content" > "$TMP_OUTPUT" ) 2>/dev/null; then
+    # mktemp chooses a name nobody can guess and creates the file with mode 600.
+    # A new output file gets the usual permissions (umask), an existing one keeps its own.
+    if TMP_OUTPUT=$(mktemp "${OUTPUT_FILE}.tmp.XXXXXX" 2>/dev/null) &&
+       ( printf '%s' "$content" > "$TMP_OUTPUT" ) 2>/dev/null; then
         if [ -f "$OUTPUT_FILE" ]; then
             chmod --reference="$OUTPUT_FILE" "$TMP_OUTPUT" 2>/dev/null
+        else
+            mode=$(printf '%o' $(( 0666 & ~$(umask) )))
+            chmod "$mode" "$TMP_OUTPUT" 2>/dev/null
         fi
         if mv -f "$TMP_OUTPUT" "$OUTPUT_FILE" 2>/dev/null; then
             TMP_OUTPUT=""
             return 0
         fi
     fi
-    rm -f "$TMP_OUTPUT" 2>/dev/null
+    [ -n "$TMP_OUTPUT" ] && rm -f "$TMP_OUTPUT" 2>/dev/null
     TMP_OUTPUT=""
 
     # Fallback if the directory is not writable: overwrite the file in place
